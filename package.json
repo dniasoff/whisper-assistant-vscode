@@ -97,6 +97,7 @@
     "typescript": "^5.1.6"
   },
   "dependencies": {
+    "ctrlc-windows": "^2.2.0",
     "openai": "^4.90.0"
   }
 }

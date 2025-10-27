@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import OpenAI from 'openai';
+import { ctrlc } from 'ctrlc-windows';
 
 const execAsync = promisify(exec);
 
@@ -42,6 +43,7 @@ class SpeechTranscription {
   private fileName: string = 'recording';
   private recordingProcess: ChildProcess | null = null;
   private tempDir: string;
+  private isUsingSox: boolean = false;
 
   constructor(
     private storagePath: string,
@@ -135,6 +137,10 @@ class SpeechTranscription {
       return false; // Return false to indicate failure
     }
 
+    // Detect if custom command is using sox
+    const commandLower = customCommand.toLowerCase().trim();
+    this.isUsingSox = commandLower.startsWith('sox ') || commandLower === 'sox';
+
     // Replace the placeholder with the actual output path (properly quoted)
     const command = customCommand.replace(/\$AUDIO_FILE/g, `"${outputPath}"`);
 
@@ -153,31 +159,42 @@ class SpeechTranscription {
 
     switch (platform) {
       case 'win32':
-        // Use cmd.exe on Windows
-        return spawn('cmd', ['/c', command]);
+        // Use PowerShell on Windows to properly handle special characters like parentheses
+        return spawn('powershell.exe', ['-NoProfile', '-Command', command], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
 
       case 'darwin':
       case 'linux':
       default:
         // Use sh on Unix-like systems (macOS, Linux, etc.)
-        return spawn('sh', ['-c', command]);
+        return spawn('sh', ['-c', command], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
     }
   }
 
   private startSoxRecording(outputPath: string): void {
     try {
-      this.recordingProcess = spawn('sox', [
-        '-d',
-        '-b',
-        '16',
-        '-e',
-        'signed',
-        '-c',
-        '1',
-        '-r',
-        '16k',
-        outputPath,
-      ]);
+      this.isUsingSox = true;
+      this.recordingProcess = spawn(
+        'sox',
+        [
+          '-d',
+          '-b',
+          '16',
+          '-e',
+          'signed',
+          '-c',
+          '1',
+          '-r',
+          '16k',
+          outputPath,
+        ],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
       this.setupProcessHandlers();
     } catch (error) {
       this.outputChannel.appendLine(
@@ -194,9 +211,11 @@ class SpeechTranscription {
     if (this.recordingProcess) {
       // Only show initial configuration
       let initialConfigShown = false;
+      let stderrBuffer = '';
 
       this.recordingProcess.stderr?.on('data', (data) => {
         const message = data.toString();
+        stderrBuffer += message;
         // Only show the initial configuration message
         if (!initialConfigShown && message.includes('Input File')) {
           this.outputChannel.appendLine(
@@ -211,10 +230,22 @@ class SpeechTranscription {
       });
 
       this.recordingProcess.on('close', (code) => {
-        if (code !== 0) {
+        // On Windows, CTRL-C exit code is 4294967295 (unsigned representation of -1)
+        const expectedExitCode = process.platform === 'win32' ? 4294967295 : null;
+        if (code === 0 || code === expectedExitCode) {
+          this.outputChannel.appendLine(
+            'Whisper Assistant: Process exited successfully',
+          );
+        } else if (code !== null) {
           this.outputChannel.appendLine(
             `Whisper Assistant: Recording process exited with code ${code}`,
           );
+          // Log stderr buffer for debugging errors
+          if (stderrBuffer) {
+            this.outputChannel.appendLine(
+              `Whisper Assistant: Process stderr:\n${stderrBuffer}`,
+            );
+          }
         }
       });
     }
@@ -232,25 +263,64 @@ class SpeechTranscription {
       'Whisper Assistant: Stopping recording gracefully',
     );
 
-    // Try graceful shutdown first with SIGINT (Ctrl+C equivalent)
-    this.recordingProcess.kill('SIGINT');
-
-    // Wait for graceful shutdown
+    // Set up exit listener before terminating process
     const gracefulShutdown = new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         resolve();
       }, 2000); // 2 second timeout
 
-      this.recordingProcess!.on('exit', () => {
+      this.recordingProcess!.once('exit', () => {
         clearTimeout(timeout);
         resolve();
       });
     });
 
+    // On Windows, use CTRL-C to gracefully shutdown sox
+    if (process.platform === 'win32' && this.isUsingSox) {
+      this.outputChannel.appendLine(
+        'Whisper Assistant: Sending CTRL-C to sox process',
+      );
+      try {
+        ctrlc(this.recordingProcess.pid!);
+      } catch (error) {
+        this.outputChannel.appendLine(
+          `Whisper Assistant: Error sending CTRL-C: ${error}`,
+        );
+      }
+
+      // Give sox a moment to process the CTRL-C signal
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } else {
+      // For ffmpeg, try sending 'q' to stdin first
+      if (this.recordingProcess.stdin) {
+        try {
+          this.recordingProcess.stdin.write('q\n');
+          this.recordingProcess.stdin.end();
+        } catch (error) {
+          this.outputChannel.appendLine(
+            `Whisper Assistant: Error sending 'q' to stdin: ${error}`,
+          );
+        }
+      }
+
+      // Send SIGINT for graceful shutdown on Unix systems
+      try {
+        this.recordingProcess.kill('SIGINT');
+      } catch (error) {
+        this.outputChannel.appendLine(
+          `Whisper Assistant: Error sending SIGINT: ${error}`,
+        );
+      }
+    }
+
     await gracefulShutdown;
 
-    // If process is still running, force kill it
-    if (this.recordingProcess && !this.recordingProcess.killed) {
+    // If process is still running (exitCode is null), force kill it
+    if (
+      this.recordingProcess &&
+      this.recordingProcess.exitCode === null &&
+      !this.recordingProcess.killed
+    ) {
       this.outputChannel.appendLine(
         'Whisper Assistant: Force stopping recording process',
       );
@@ -277,9 +347,35 @@ class SpeechTranscription {
         `Whisper Assistant: Transcribing recording using ${provider} API`,
       );
 
-      const audioFile = fs.createReadStream(
-        path.join(this.tempDir, `${this.fileName}.wav`),
-      );
+      // Wait for file to be ready and have content
+      const recordingPath = path.join(this.tempDir, `${this.fileName}.wav`);
+      let fileReady = false;
+      let attempts = 0;
+      const maxAttempts = 10;
+
+      while (!fileReady && attempts < maxAttempts) {
+        try {
+          const stats = fs.statSync(recordingPath);
+          if (stats.size > 0) {
+            fileReady = true;
+          } else {
+            attempts++;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        } catch (error) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+
+      if (!fileReady) {
+        vscode.window.showErrorMessage(
+          'Whisper Assistant: Recording file is not ready for transcription',
+        );
+        return undefined;
+      }
+
+      const audioFile = fs.createReadStream(recordingPath);
 
       // Get the configured model or fall back to provider default
       const configuredModel = config.get<string | null>('model');
@@ -365,16 +461,21 @@ class SpeechTranscription {
     }
   }
 
-  deleteFiles(): void {
+  async deleteFiles(): Promise<void> {
     try {
+      // On Windows, give the system a moment to release file handles
+      if (process.platform === 'win32') {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+
       const wavFile = path.join(this.tempDir, `${this.fileName}.wav`);
       const jsonFile = path.join(this.tempDir, `${this.fileName}.json`);
 
       if (fs.existsSync(wavFile)) {
-        fs.unlinkSync(wavFile);
+        await fs.promises.unlink(wavFile);
       }
       if (fs.existsSync(jsonFile)) {
-        fs.unlinkSync(jsonFile);
+        await fs.promises.unlink(jsonFile);
       }
     } catch (error) {
       this.outputChannel.appendLine(
